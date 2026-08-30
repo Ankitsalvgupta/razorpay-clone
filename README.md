@@ -56,16 +56,21 @@ The system is currently implemented as a single Spring Boot module — domain mo
 ```
 src/main/java/com/ankitgupta/razorpay/
 ├── common/
-│   ├── entity/        # Shared value types (Money)
-│   └── enums/         # Shared enums (statuses, actors, events, roles)
+│   ├── entity/         # Shared value types (Money)
+│   ├── enums/          # Shared enums (statuses, actors, events, roles)
+│   └── exception/      # GlobalExceptionHandler, custom exceptions, ErrorResponse
 ├── merchant/
-│   └── entity/        # Merchant, ApiKey, AppUser, Customer, MerchantWebhookConfig
+│   ├── entity/         # Merchant, ApiKey, AppUser, Customer, MerchantWebhookConfig
+│   ├── controller/     # AuthController, ApiKeyController
+│   ├── service/        # AuthService, ApiKeyService (+ impl)
+│   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository
+│   └── dto/             # request/response DTOs
 ├── payment/
-│   └── entity/        # OrderRecord, Payment, Refund, PaymentTransitionLog
+│   └── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
 ├── vault/
-│   └── entity/        # VaultCard, CardToken
+│   └── entity/         # VaultCard, CardToken
 └── operations/
-    └── entity/        # WebhookEvent, Settlement, SettlementPayment, DlqEvent
+    └── entity/         # WebhookEvent, Settlement, SettlementPayment, DlqEvent
 ```
 
 ## Getting Started
@@ -102,10 +107,15 @@ Set the following environment variables:
 
 **Completed**
 - JPA entity layer modeled across all five domains (Merchant, Payment, Vault, Operations, Common)
+- Merchant signup flow (`AuthController`, `AuthService`)
+- API key issuance flow (`ApiKeyController`, `ApiKeyService`)
+- Repository layer for Merchant, ApiKey, AppUser
+- Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
+- Request validation via `spring-boot-starter-validation`
 
 **In Progress / Not Started**
-- Repository, service, and controller layers
-- Authentication (API key + JWT) and request validation
+- Remaining service and controller layers (payment, vault, operations)
+- JWT authentication
 - Idempotency handling for orders and payments
 - Kafka outbox publishing and consumers
 - Vault encryption and card tokenization logic
@@ -114,6 +124,13 @@ Set the following environment variables:
 - Test coverage, Docker Compose, CI pipeline
 
 ## Development Log
+
+### 2026-08-30
+- Implemented merchant signup flow: `AuthController`, `AuthService`/`AuthServiceImpl`, `MerchantSignupRequest`/`MerchantResponse` DTOs
+- Implemented API key issuance flow: `ApiKeyController`, `ApiKeyService`/`ApiKeyServiceImpl`, `CreateApiKeyRequest`/`ApiKeyCreateResponse` DTOs
+- Added repository layer: `MerchantRepository`, `ApiKeyRepository`, `AppUserRepository`
+- Added global exception handling: `GlobalExceptionHandler`, `ResourceNotFoundException`, `DuplicateResourceException`, `ErrorResponse`
+- Added `spring-boot-starter-validation` dependency for request validation
 
 ### 2026-08-27
 - Modeled full entity relationship schema and JPA entities across merchant, payment, vault, and operations domains
