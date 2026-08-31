@@ -58,7 +58,8 @@ src/main/java/com/ankitgupta/razorpay/
 ├── common/
 │   ├── entity/         # Shared value types (Money)
 │   ├── enums/          # Shared enums (statuses, actors, events, roles)
-│   └── exception/      # GlobalExceptionHandler, custom exceptions, ErrorResponse
+│   ├── exception/      # GlobalExceptionHandler, custom exceptions, ErrorResponse
+│   └── util/           # RandomizerUtil
 ├── merchant/
 │   ├── entity/         # Merchant, ApiKey, AppUser, Customer, MerchantWebhookConfig
 │   ├── controller/     # AuthController, ApiKeyController
@@ -66,7 +67,11 @@ src/main/java/com/ankitgupta/razorpay/
 │   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository
 │   └── dto/             # request/response DTOs
 ├── payment/
-│   └── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
+│   ├── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
+│   ├── controller/     # OrderController
+│   ├── service/        # OrderService (+ impl)
+│   ├── repository/     # OrderRepository, PaymentRepository
+│   └── dto/             # request/response DTOs
 ├── vault/
 │   └── entity/         # VaultCard, CardToken
 └── operations/
@@ -108,22 +113,20 @@ Set the following environment variables:
 **Completed**
 - JPA entity layer modeled across all five domains (Merchant, Payment, Vault, Operations, Common)
 - Merchant signup flow (`AuthController`, `AuthService`)
-- API key issuance flow (`ApiKeyController`, `ApiKeyService`)
-- Repository layer for Merchant, ApiKey, AppUser
+- API key lifecycle: issuance, listing, revocation, rotation (`ApiKeyController`, `ApiKeyService`)
+- Order creation flow (`OrderController`, `OrderService`)
+- Repository layer for Merchant, ApiKey, AppUser, Order, Payment
 - Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
 - Request validation via `spring-boot-starter-validation`
 
-**In Progress / Not Started**
-- Remaining service and controller layers (payment, vault, operations)
-- JWT authentication
-- Idempotency handling for orders and payments
-- Kafka outbox publishing and consumers
-- Vault encryption and card tokenization logic
-- Webhook delivery with retry and dead-letter handling
-- Settlement batch processing
-- Test coverage, Docker Compose, CI pipeline
-
 ## Development Log
+
+### 2026-08-31
+- Added API key management: list keys by merchant, revoke key, rotate key (with grace period on the previous secret)
+- Implemented order creation flow: `OrderController`, `OrderService`/`OrderServiceImpl`, duplicate-receipt detection, configurable order expiry
+- Added `RandomizerUtil` for key/secret generation
+- Added `jackson-databind` dependency
+- Refactored `Money` to use Lombok annotations instead of manual boilerplate
 
 ### 2026-08-30
 - Implemented merchant signup flow: `AuthController`, `AuthService`/`AuthServiceImpl`, `MerchantSignupRequest`/`MerchantResponse` DTOs
