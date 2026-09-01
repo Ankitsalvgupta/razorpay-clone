@@ -48,6 +48,7 @@ The system is currently implemented as a single Spring Boot module — domain mo
 - **Language:** Java 25
 - **Framework:** Spring Boot 4.1.1, Spring Data JPA
 - **Database:** PostgreSQL
+- **Mapping:** MapStruct
 - **Build Tool:** Maven
 - **Planned:** Spring Security, Apache Kafka, Redis, Docker, Zipkin, Prometheus/Grafana
 
@@ -56,7 +57,7 @@ The system is currently implemented as a single Spring Boot module — domain mo
 ```
 src/main/java/com/ankitgupta/razorpay/
 ├── common/
-│   ├── entity/         # Shared value types (Money)
+│   ├── entity/         # Shared value types (Money, BaseEntity)
 │   ├── enums/          # Shared enums (statuses, actors, events, roles)
 │   ├── exception/      # GlobalExceptionHandler, custom exceptions, ErrorResponse
 │   └── util/           # RandomizerUtil
@@ -65,12 +66,14 @@ src/main/java/com/ankitgupta/razorpay/
 │   ├── controller/     # AuthController, ApiKeyController
 │   ├── service/        # AuthService, ApiKeyService (+ impl)
 │   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository
+│   ├── mapper/          # MerchantMapper, ApiKeyMapper
 │   └── dto/             # request/response DTOs
 ├── payment/
 │   ├── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
 │   ├── controller/     # OrderController
 │   ├── service/        # OrderService (+ impl)
 │   ├── repository/     # OrderRepository, PaymentRepository
+│   ├── mapper/          # OrderMapper, PaymentMapper
 │   └── dto/             # request/response DTOs
 ├── vault/
 │   └── entity/         # VaultCard, CardToken
@@ -118,8 +121,21 @@ Set the following environment variables:
 - Repository layer for Merchant, ApiKey, AppUser, Order, Payment
 - Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
 - Request validation via `spring-boot-starter-validation`
+- Entity auditing (`BaseEntity` with `createdAt`/`updatedAt`, `@EnableJpaAuditing`)
+- MapStruct mappers for Merchant, ApiKey, Order, Payment DTO conversion
 
 ## Development Log
+
+### 2026-09-01
+- Added JPA auditing: `BaseEntity` with `@CreatedDate`/`@LastModifiedDate`, wired into entities via `@EnableJpaAuditing`
+- Added MapStruct dependency and mappers: `MerchantMapper`, `ApiKeyMapper`, `OrderMapper`, `PaymentMapper`
+- Added `BusinessRuleViolationException` for business-rule-level errors
+- Added `PaymentResponse` DTO
+- Refactored service layer to use mappers instead of manual DTO construction
+- Fixed MapStruct core/processor version mismatch in `pom.xml`
+- Fixed `SettlementPaymentId`/`SettlementPayment` auditing placement (moved `BaseEntity` inheritance to the entity, off the embedded ID)
+- Fixed `MerchantMapper` field mapping for `status` → `merchantStatus`
+- Added database indexes across entities: `ApiKey`, `Merchant`, `AppUser`, `Customer`, `MerchantWebhookConfig`, `Payment`, `OrderRecord`, `PaymentTransitionLog`
 
 ### 2026-08-31
 - Added API key management: list keys by merchant, revoke key, rotate key (with grace period on the previous secret)

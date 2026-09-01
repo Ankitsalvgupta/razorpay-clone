@@ -1,5 +1,6 @@
 package com.ankitgupta.razorpay.merchant.entity;
 
+import com.ankitgupta.razorpay.common.entity.BaseEntity;
 import com.ankitgupta.razorpay.common.enums.Environment;
 import jakarta.persistence.*;
 import lombok.*;
@@ -8,13 +9,16 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "api_key")
+@Table(name = "api_key",
+    indexes = {
+        @Index(name = "idx_api_key_merchant_env", columnList = "merchant_id, environment, enabled")
+    })
 @Getter
 @Setter
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class ApiKey {
+public class ApiKey extends BaseEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
@@ -39,7 +43,7 @@ public class ApiKey {
 
     @Column(nullable = false)
     @Builder.Default
-    private Boolean enabled = true;
+    private boolean enabled = true;
 
     private LocalDateTime lastUsedAt;
 
