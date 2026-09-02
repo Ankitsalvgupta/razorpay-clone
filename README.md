@@ -46,18 +46,17 @@ The system is currently implemented as a single Spring Boot module — domain mo
 ## Tech Stack
 
 - **Language:** Java 25
-- **Framework:** Spring Boot 4.1.1, Spring Data JPA
+- **Framework:** Spring Boot 4.1.1, Spring Data JPA, Spring Security
 - **Database:** PostgreSQL
-- **Mapping:** MapStruct
 - **Build Tool:** Maven
-- **Planned:** Spring Security, Apache Kafka, Redis, Docker, Zipkin, Prometheus/Grafana
+- **Planned:** Apache Kafka, Redis, Docker, Zipkin, Prometheus/Grafana
 
 ## Project Structure
 
 ```
 src/main/java/com/ankitgupta/razorpay/
 ├── common/
-│   ├── entity/         # Shared value types (Money, BaseEntity)
+│   ├── entity/         # Shared value types (Money)
 │   ├── enums/          # Shared enums (statuses, actors, events, roles)
 │   ├── exception/      # GlobalExceptionHandler, custom exceptions, ErrorResponse
 │   └── util/           # RandomizerUtil
@@ -65,20 +64,32 @@ src/main/java/com/ankitgupta/razorpay/
 │   ├── entity/         # Merchant, ApiKey, AppUser, Customer, MerchantWebhookConfig
 │   ├── controller/     # AuthController, ApiKeyController
 │   ├── service/        # AuthService, ApiKeyService (+ impl)
+│   ├── mapper/          # MerchantMapper, ApiKeyMapper (MapStruct)
 │   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository
-│   ├── mapper/          # MerchantMapper, ApiKeyMapper
 │   └── dto/             # request/response DTOs
 ├── payment/
 │   ├── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
-│   ├── controller/     # OrderController
-│   ├── service/        # OrderService (+ impl)
-│   ├── repository/     # OrderRepository, PaymentRepository
-│   ├── mapper/          # OrderMapper, PaymentMapper
-│   └── dto/             # request/response DTOs
+│   ├── controller/     # OrderController, PaymentController
+│   ├── service/        # OrderService, PaymentService (+ impl)
+│   ├── statemachine/   # PaymentStateMachine, PaymentTransitionService
+│   ├── gateway/        # PaymentGatewayRouter, PaymentAdapter + UPI/Card/NetBanking adapters
+│   ├── processor/      # PaymentProcessorRouter, PaymentProcessor strategies (UPI/Card/NetBanking)
+│   ├── simulator/      # BankCallbackSimulator, SimulatorConfig (configurable chaos/delay/success-rate)
+│   ├── config/         # PaymentProcessorConfig, PaymentAdapterConfig
+│   ├── mapper/          # OrderMapper, PaymentMapper (MapStruct)
+│   ├── repository/     # OrderRepository, PaymentRepository, PaymentTransitionLogRepository
+│   └── dto/             # request/response DTOs (CreateOrderRequest, PaymentInitRequest, OrderResponse, PaymentResponse)
 ├── vault/
-│   └── entity/         # VaultCard, CardToken
+│   ├── entity/         # VaultCard, CardToken
+│   ├── controller/     # VaultController
+│   ├── service/        # VaultService (+ impl) — card tokenization
+│   ├── repository/     # VaultCardRepository, CardTokenRepository
+│   ├── validation/     # ExpiryYear custom validator
+│   ├── config/         # VaultEncryptionConfig
+│   └── dto/             # TokenizeRequest, TokenizeResponse
 └── operations/
-    └── entity/         # WebhookEvent, Settlement, SettlementPayment, DlqEvent
+    ├── entity/         # WebhookEvent, Settlement, SettlementPayment, DlqEvent
+    └── dto/             # (scaffolded, no service/controller yet)
 ```
 
 ## Getting Started
@@ -117,25 +128,26 @@ Set the following environment variables:
 - JPA entity layer modeled across all five domains (Merchant, Payment, Vault, Operations, Common)
 - Merchant signup flow (`AuthController`, `AuthService`)
 - API key lifecycle: issuance, listing, revocation, rotation (`ApiKeyController`, `ApiKeyService`)
-- Order creation flow (`OrderController`, `OrderService`)
-- Repository layer for Merchant, ApiKey, AppUser, Order, Payment
-- Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
+- Order service layer: create, get by id, cancel, list payments for an order (`OrderService`/`OrderServiceImpl`) — only `create` is currently wired to `OrderController`
+- MapStruct mapper layer for Merchant, ApiKey, Order, and Payment DTO conversions, replacing manual field-by-field mapping
+- Payment initiation and capture flow (`PaymentController`, `PaymentService`/`PaymentServiceImpl`), with a method-based routing layer (`PaymentGatewayRouter` → `PaymentAdapter` per method → `PaymentProcessorRouter` → `PaymentProcessor` strategy per method) for UPI, Card, and NetBanking
+- Explicit payment state machine (`PaymentStateMachine`) with a transition service (`PaymentTransitionService`) that logs every status change to `PaymentTransitionLog`
+- Configurable bank callback simulator (`BankCallbackSimulator`, `SimulatorConfig`) with per-method delay/success-rate and a chaos mode, for exercising the async payment flow without a real bank integration
+- Card vault: tokenization endpoint and service (`VaultController`, `VaultService`/`VaultServiceImpl`), with dedicated encryption config and a custom expiry-year validator
+- Repository layer for Merchant, ApiKey, AppUser, Order, Payment, PaymentTransitionLog, VaultCard, CardToken
+- Global exception handling (`GlobalExceptionHandler`, custom exceptions including `InvalidStateTransitionException`, error response format)
 - Request validation via `spring-boot-starter-validation`
-- Entity auditing (`BaseEntity` with `createdAt`/`updatedAt`, `@EnableJpaAuditing`)
-- MapStruct mappers for Merchant, ApiKey, Order, Payment DTO conversion
 
 ## Development Log
 
-### 2026-09-01
-- Added JPA auditing: `BaseEntity` with `@CreatedDate`/`@LastModifiedDate`, wired into entities via `@EnableJpaAuditing`
-- Added MapStruct dependency and mappers: `MerchantMapper`, `ApiKeyMapper`, `OrderMapper`, `PaymentMapper`
-- Added `BusinessRuleViolationException` for business-rule-level errors
-- Added `PaymentResponse` DTO
-- Refactored service layer to use mappers instead of manual DTO construction
-- Fixed MapStruct core/processor version mismatch in `pom.xml`
-- Fixed `SettlementPaymentId`/`SettlementPayment` auditing placement (moved `BaseEntity` inheritance to the entity, off the embedded ID)
-- Fixed `MerchantMapper` field mapping for `status` → `merchantStatus`
-- Added database indexes across entities: `ApiKey`, `Merchant`, `AppUser`, `Customer`, `MerchantWebhookConfig`, `Payment`, `OrderRecord`, `PaymentTransitionLog`
+### 2026-09-02
+- Added payment initiation and capture flow: `PaymentController`, `PaymentService`/`PaymentServiceImpl`, `PaymentInitRequest` DTO
+- Built the payment routing layer: `PaymentGatewayRouter`/`PaymentAdapter` (per payment method) and `PaymentProcessorRouter`/`PaymentProcessor` strategies for UPI, Card, and NetBanking, plus `PaymentAdapterConfig`/`PaymentProcessorConfig`
+- Added an explicit payment state machine: `PaymentStateMachine`, `PaymentTransitionService`, `PaymentTransitionLogRepository`, and `InvalidStateTransitionException`
+- Added `BankCallbackSimulator` and `SimulatorConfig` to simulate async bank callbacks with configurable delay, success rate, and chaos mode; enabled scheduling (`@EnableScheduling`) in `RazorpayApplication`
+- Added the Vault domain's service layer: `VaultController`, `VaultService`/`VaultServiceImpl`, `TokenizeRequest`/`TokenizeResponse` DTOs, `VaultCardRepository`/`CardTokenRepository`, `VaultEncryptionConfig`, and a custom `@ExpiryYear` validator
+- Added `CardBrand` and `ChaosMode` enums
+- Added `spring-boot-starter-security` dependency and a `vault.master-key` entry in `application.yaml.example`
 
 ### 2026-08-31
 - Added API key management: list keys by merchant, revoke key, rotate key (with grace period on the previous secret)
@@ -143,6 +155,9 @@ Set the following environment variables:
 - Added `RandomizerUtil` for key/secret generation
 - Added `jackson-databind` dependency
 - Refactored `Money` to use Lombok annotations instead of manual boilerplate
+- Introduced MapStruct (`mapstruct`, `mapstruct-processor`, `lombok-mapstruct-binding`) and replaced manual mapping in `AuthServiceImpl`/`OrderServiceImpl` with generated mappers: `MerchantMapper`, `ApiKeyMapper`, `OrderMapper`, `PaymentMapper`
+- Extended `OrderService`/`OrderServiceImpl` with `getById`, `cancel`, and `listPayments`, plus `PaymentRepository.findByOrder_Id` and `PaymentResponse`/`PaymentMapper` to support listing an order's payments
+- Added `operations/dto` package (scaffolding, not yet backed by a service or controller)
 
 ### 2026-08-30
 - Implemented merchant signup flow: `AuthController`, `AuthService`/`AuthServiceImpl`, `MerchantSignupRequest`/`MerchantResponse` DTOs
