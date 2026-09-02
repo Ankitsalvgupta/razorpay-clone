@@ -12,6 +12,8 @@ spring:
     hibernate:
       ddl-auto: update
     show-sql: true
+vault:
+  master-key: {MASTER_KEY}
 
 # Environment variables required:
 # DB_URL      = jdbc:postgresql://localhost:5432/razorpayDB
