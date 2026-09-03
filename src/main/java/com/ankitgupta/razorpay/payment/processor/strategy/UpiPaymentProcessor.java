@@ -4,7 +4,9 @@ import com.ankitgupta.razorpay.common.util.RandomizerUtil;
 import com.ankitgupta.razorpay.payment.processor.PaymentProcessor;
 import com.ankitgupta.razorpay.payment.processor.dto.PaymentProcessorRequest;
 import com.ankitgupta.razorpay.payment.processor.dto.PaymentProcessorResponse;
+import org.springframework.stereotype.Component;
 
+@Component
 public class UpiPaymentProcessor implements PaymentProcessor {
 
     @Override
