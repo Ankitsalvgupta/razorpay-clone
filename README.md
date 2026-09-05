@@ -50,14 +50,18 @@ The system is currently implemented as a single Spring Boot module — domain mo
 
 Both filters populate a request-scoped `MerchantContext`, so downstream controllers/services no longer need the merchant ID passed in manually. JPA auditing (`BaseEntity` + `AuditorAwareImpl`) uses this same context to stamp `createdBy`/`updatedBy` with the API key ID (or merchant ID as a fallback).
 
+API key lookups are backed by a **Redis cache** (`ApiKeyCache` / `RedisApiKeyCache`, 5-minute TTL) so the API-key filter doesn't hit Postgres on every request; a cache miss falls back to the DB and repopulates the cache. Each API-key-authenticated request is also checked against a **Redis-backed fixed-window rate limiter** (`RateLimiter` / `FixedWindowRateLimiter`), keyed per API key, with configurable requests-per-minute. Requests over the limit get a `429` with `Retry-After` / `X-RateLimit-*` headers; allowed requests get their remaining quota back in the response headers.
+
 ## Tech Stack
 
 - **Language:** Java 25
 - **Framework:** Spring Boot 4.1.1, Spring Data JPA, Spring Security
 - **Auth:** JWT (`jjwt`), BCrypt-hashed API keys
 - **Database:** PostgreSQL
+- **Cache / Rate Limiting:** Redis (`spring-boot-starter-data-redis`) — API key cache + fixed-window rate limiter
+- **Object Mapping:** MapStruct
 - **Build Tool:** Maven
-- **Planned:** Apache Kafka, Redis, Docker, Zipkin, Prometheus/Grafana
+- **Planned:** Apache Kafka, Docker, Zipkin, Prometheus/Grafana
 
 ## Project Structure
 
@@ -67,7 +71,9 @@ src/main/java/com/ankitgupta/razorpay/
 │   ├── entity/         # Shared value types (Money), BaseEntity (created/updated audit columns)
 │   ├── audit/           # AuditorAwareImpl — resolves current actor for JPA auditing
 │   ├── enums/          # Shared enums (statuses, actors, events, roles)
-│   ├── exception/      # GlobalExceptionHandler, custom exceptions, ErrorResponse
+│   ├── exception/      # GlobalExceptionHandler, custom exceptions (incl. RateLimitException), ErrorResponse
+│   ├── ratelimit/       # RateLimiter, FixedWindowRateLimiter, RateLimitResult
+│   ├── config/          # RedisConfig
 │   └── util/           # RandomizerUtil
 ├── merchant/
 │   ├── entity/         # Merchant, ApiKey, AppUser, Customer, MerchantWebhookConfig
@@ -76,6 +82,7 @@ src/main/java/com/ankitgupta/razorpay/
 │   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository
 │   ├── security/       # WebSecurityConfig, JwtUtil, JwtAuthenticationFilter,
 │   │                    # ApiKeyAuthenticationFilter, MerchantContext
+│   ├── cache/           # ApiKeyCache, ApiKeyCacheEntry, RedisApiKeyCache
 │   └── dto/             # request/response DTOs
 ├── payment/
 │   ├── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
@@ -115,7 +122,12 @@ Set the following environment variables:
 | `DB_URL`      | JDBC URL, e.g. `jdbc:postgresql://localhost:5432/razorpayDB` |
 | `DB_USERNAME` | PostgreSQL username                                          |
 | `DB_PASSWORD` | PostgreSQL password                                          |
-| `JWT_SECRET`  | Secret key used to sign/verify JWT access tokens              |
+| `SECRET_KEY`  | Secret key used to sign/verify JWT access tokens              |
+| `REDIS_HOST`  | Redis host (defaults to `localhost`)                          |
+| `REDIS_PORT`  | Redis port (defaults to `6379`)                               |
+| `REDIS_PASSWORD` | Redis password, if any (defaults to empty)                 |
+
+A local Redis instance is required — e.g. `docker run -p 6379:6379 redis` — for the API key cache and rate limiter to work.
 
 ### Run
 
@@ -139,6 +151,8 @@ Set the following environment variables:
 - Repository layer for Merchant, ApiKey, AppUser, Order, Payment
 - Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
 - Request validation via `spring-boot-starter-validation`
+- Redis-backed API key cache (`ApiKeyCache`/`RedisApiKeyCache`) to avoid a DB hit on every API-key-authenticated request
+- Redis-backed fixed-window rate limiter (`RateLimiter`/`FixedWindowRateLimiter`) applied per API key in `ApiKeyAuthenticationFilter`, with `429`/`Retry-After`/`X-RateLimit-*` handling in `GlobalExceptionHandler`
 
 **In progress**
 
@@ -153,6 +167,15 @@ Set the following environment variables:
 This project is being built step by step, domain by domain, rather than end-to-end — expect other rough edges outside of what's listed above as work progresses.
 
 ## Development Log
+
+### 2026-09-05
+
+- Added Redis integration (`RedisConfig`, `StringRedisTemplate` bean)
+- Added `ApiKeyCache` interface with a `RedisApiKeyCache` implementation (5-minute TTL) — `ApiKeyAuthenticationFilter` now checks the cache before hitting `ApiKeyRepository`, and repopulates the cache on a miss
+- Added Redis-backed fixed-window rate limiting: `RateLimiter` interface, `FixedWindowRateLimiter` implementation, `RateLimitResult`, keyed per API key and applied inside `ApiKeyAuthenticationFilter`
+- Added `RateLimitException` and a corresponding handler in `GlobalExceptionHandler` returning `429` with `Retry-After` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` headers
+- `ApiKeyServiceImpl` now evicts the Redis cache entry on key revoke and rotate, so stale keys/secrets stop working immediately instead of waiting out the TTL
+- Added `spring-boot-starter-data-redis` dependency and Redis connection settings (`REDIS_HOST`/`REDIS_PORT`/`REDIS_PASSWORD`) to `application.yaml.example`
 
 ### 2026-09-04
 
