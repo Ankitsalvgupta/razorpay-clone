@@ -56,8 +56,6 @@ public class AuthServiceImpl implements AuthService {
                 .build();
         appUserRepository.save(appUser);
 
-
-
         return merchantMapper.toResponse(merchant);
     }
 

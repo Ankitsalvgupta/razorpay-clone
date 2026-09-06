@@ -19,11 +19,13 @@ The system is designed around five domains:
 
 | Domain | Responsibility |
 |---|---|
-| **Merchant** | Merchant accounts, KYC, API key issuance, dashboard users, webhook configuration |
+| **Merchant** | Merchant accounts, KYC, API key issuance, dashboard users, customers, webhook configuration |
 | **Payment** | Orders, payments, refunds, and payment state transitions |
 | **Vault** | PCI-scoped card storage and tokenization, isolated from the rest of the system |
 | **Operations** | Webhook delivery, settlements, dead-letter/event replay |
 | **Common** | Shared value types, enums, rate limiting, and idempotency infrastructure |
+
+Cross-domain references (e.g. an order's `merchantId`/`customerId`, a card token's `merchant`/`customer`) are stored as plain UUIDs rather than JPA relationships, in anticipation of the eventual microservices split where these domains will live in separate services with separate databases.
 
 ## Architecture
 
@@ -32,7 +34,7 @@ Target deployment is a microservices architecture:
 | Service | Responsibility |
 |---|---|
 | `api-gateway` | Authentication, rate limiting, request routing |
-| `merchant-service` | Merchant authorization, KYC, API key management |
+| `merchant-service` | Merchant authorization, KYC, API key management, customers |
 | `payment-service` | Order creation, payment processing, refunds |
 | `operations-service` | Webhook dispatch, settlement processing, analytics |
 | `vault-service` | Isolated PCI scope; card tokenization |
@@ -79,8 +81,8 @@ src/main/java/com/ankitgupta/razorpay/
 ├── merchant/
 │   ├── entity/         # Merchant, ApiKey, AppUser, Customer, MerchantWebhookConfig
 │   ├── controller/     # AuthController, ApiKeyController
-│   ├── service/        # AuthService, ApiKeyService (+ impl)
-│   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository
+│   ├── service/        # AuthService, ApiKeyService, CustomerService (+ impl)
+│   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository, CustomerRepository
 │   ├── mapper/          # MerchantMapper, ApiKeyMapper
 │   ├── security/        # JwtUtil, WebSecurityConfig, MerchantUserDetailsService, MerchantContext, JwtAuthenticationFilter, ApiKeyAuthenticationFilter
 │   └── dto/             # request/response DTOs
@@ -88,7 +90,7 @@ src/main/java/com/ankitgupta/razorpay/
 │   ├── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
 │   ├── controller/     # OrderController, PaymentController
 │   ├── service/        # OrderService, PaymentService (+ impl)
-│   ├── repository/     # OrderRepository, PaymentRepository, PaymentTransitionLogRepository
+│   ├── repository/     # OrderRepository, PaymentRepository, PaymentTransitionLogRepository (pessimistic-lock lookups for order/payment)
 │   ├── mapper/          # OrderMapper, PaymentMapper
 │   ├── gateway/         # PaymentAdapter + per-method adapters (Card, NetBanking, UPI)
 │   ├── processor/       # PaymentProcessor + per-method strategies (Card, NetBanking, UPI)
@@ -97,7 +99,7 @@ src/main/java/com/ankitgupta/razorpay/
 │   ├── config/          # PaymentAdapterConfig, PaymentProcessorConfig
 │   └── dto/             # request/response DTOs
 ├── vault/
-│   ├── entity/          # VaultCard, CardToken
+│   ├── entity/          # VaultCard, CardToken (linked to customer/merchant via UUID)
 │   ├── controller/      # VaultController
 │   ├── service/         # VaultService (+ impl)
 │   ├── repository/      # VaultCardRepository, CardTokenRepository
@@ -146,21 +148,29 @@ Set the following environment variables:
 - Merchant signup and login flow (`AuthController`, `AuthService`), password hashing via `BCryptPasswordEncoder`
 - JWT authentication and API key authentication, each with its own Spring Security filter chain
 - API key lifecycle: issuance, listing, revocation, rotation, Redis-backed caching (`ApiKeyController`, `ApiKeyService`)
+- Customer find-or-create flow (`CustomerService`), linked to orders and vault card tokens
 - Order creation flow (`OrderController`, `OrderService`)
-- Payment initiation and capture flow (`PaymentController`, `PaymentService`)
+- Payment initiation and capture flow (`PaymentController`, `PaymentService`), with pessimistic row locking on order/payment lookups to prevent concurrent-request races
 - Payment routing via Strategy/Adapter pattern across Card, NetBanking, and UPI methods
 - Payment state machine for status transitions, with transition logging
-- Vault card tokenization with envelope encryption (AES-GCM, DEK/KEK key hierarchy)
+- Bank callback authorization resolution (`resolveAuthorization`), completing the async payment confirmation flow
+- Vault card tokenization with envelope encryption (AES-GCM, DEK/KEK key hierarchy), tokens linked to customer and merchant
 - Bank callback simulator for asynchronous payment status polling
 - Swappable rate limiting (fixed window, sliding window, sliding window via Lua, token bucket via Lua), selected via config
 - Redis-backed idempotency handling for POST/PUT/PATCH requests, scoped per merchant
-- Repository layer for Merchant, ApiKey, AppUser, Order, Payment, PaymentTransitionLog, VaultCard, CardToken
+- Repository layer for Merchant, ApiKey, AppUser, Customer, Order, Payment, PaymentTransitionLog, VaultCard, CardToken
 - Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
 - Request validation via `spring-boot-starter-validation`, including a custom `@ExpiryYear` validator
 - Entity auditing (`BaseEntity` with `createdAt`/`updatedAt`, `@EnableJpaAuditing`, `AuditorAwareImpl`)
 - MapStruct mappers for Merchant, ApiKey, Order, Payment DTO conversion
 
 ## Development Log
+
+### 2026-09-06
+- Added customer find-or-create flow: `Customer` entity, `CustomerRepository`, `CustomerService`/`CustomerServiceImpl`
+- Linked customers to orders (`OrderRecord.customerId`, via `CreateOrderRequest.customer`) and vault card tokens (`CardToken.customer`)
+- Added pessimistic row locking on order and payment lookups (`findByIdAndMerchantIdForUpdate`, `findByIdForUpdate`) to prevent concurrent-request races during payment initiation, capture, and authorization
+- Added `PaymentServiceImpl.resolveAuthorization()` to handle bank callback authorization outcomes, including auto-capture on approval
 
 ### 2026-09-05
 - Added idempotency handling: `IdempotencyFilter`, `IdempotencyStore` interface, `RedisIdempotencyStoreStore`, `IdempotencyConflictException`

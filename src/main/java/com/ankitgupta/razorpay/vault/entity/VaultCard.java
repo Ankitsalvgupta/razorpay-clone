@@ -40,6 +40,7 @@ public class VaultCard extends BaseEntity {
     private byte[] encryptedDek;
 
     @Column(nullable = false)
+    @Enumerated(EnumType.STRING)
     private CardBrand brand; // e.g. VISA, MASTERCARD, AMEX, etc.
 
     @Column(nullable = false)
