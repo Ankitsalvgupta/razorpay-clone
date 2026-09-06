@@ -6,60 +6,61 @@ A payment gateway backend modeled on Razorpay's core flows — merchant onboardi
 
 - [Overview](#overview)
 - [Architecture](#architecture)
+- [Design Patterns](#design-patterns)
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
 - [Development Status](#development-status)
-- [Known Issues](#known-issues)
 - [Development Log](#development-log)
 
 ## Overview
 
 The system is designed around five domains:
 
-| Domain         | Responsibility                                                                   |
-| -------------- | -------------------------------------------------------------------------------- |
-| **Merchant**   | Merchant accounts, KYC, API key issuance, dashboard users, webhook configuration |
-| **Payment**    | Orders, payments, refunds, and payment state transitions                         |
-| **Vault**      | PCI-scoped card storage and tokenization, isolated from the rest of the system   |
-| **Operations** | Webhook delivery, settlements, dead-letter/event replay                          |
-| **Common**     | Shared value types, enums, and cross-cutting concerns (auditing) used across domains |
+| Domain | Responsibility |
+|---|---|
+| **Merchant** | Merchant accounts, KYC, API key issuance, dashboard users, webhook configuration |
+| **Payment** | Orders, payments, refunds, and payment state transitions |
+| **Vault** | PCI-scoped card storage and tokenization, isolated from the rest of the system |
+| **Operations** | Webhook delivery, settlements, dead-letter/event replay |
+| **Common** | Shared value types, enums, rate limiting, and idempotency infrastructure |
 
 ## Architecture
 
 Target deployment is a microservices architecture:
 
-| Service              | Responsibility                                     |
-| -------------------- | --------------------------------------------------- |
-| `api-gateway`        | Authentication, rate limiting, request routing     |
-| `merchant-service`   | Merchant authorization, KYC, API key management    |
-| `payment-service`    | Order creation, payment processing, refunds        |
+| Service | Responsibility |
+|---|---|
+| `api-gateway` | Authentication, rate limiting, request routing |
+| `merchant-service` | Merchant authorization, KYC, API key management |
+| `payment-service` | Order creation, payment processing, refunds |
 | `operations-service` | Webhook dispatch, settlement processing, analytics |
-| `vault-service`      | Isolated PCI scope; card tokenization              |
-| `discovery-service`  | Service discovery                                  |
-| `config-service`     | Centralized configuration                          |
-| `common-lib`         | Shared models and utilities                        |
+| `vault-service` | Isolated PCI scope; card tokenization |
+| `discovery-service` | Service discovery |
+| `config-service` | Centralized configuration |
+| `common-lib` | Shared models and utilities |
 
-Asynchronous communication is handled via **Kafka** using the outbox pattern; **Redis** is used for caching and counters. Observability is provided through **Zipkin** (distributed tracing) and **Prometheus/Grafana** (metrics).
+Asynchronous communication is handled via **Kafka** using the outbox pattern; **Redis** is used for caching, rate limiting, and idempotency key storage. Observability is provided through **Zipkin** (distributed tracing) and **Prometheus/Grafana** (metrics).
 
 The system is currently implemented as a single Spring Boot module — domain modeling and business logic are being built out first, with the microservices split planned once core flows are validated.
 
-**Authentication** is split by consumer:
-- **Dashboard/admin routes** (`/v1/auth/**`, `/v1/merchant/**`, `/v1/admin/**`, `/v1/actuator/**`) are protected by a stateless **JWT** filter chain. Tokens carry the merchant's email as subject plus `merchant_id` and `role` claims.
-- **API-facing routes** (`/v1/orders/**`, `/v1/payments/**`, `/v1/vault/**`) are protected by a **Basic Auth-style API key** filter, validated against BCrypt-hashed key secrets, with a 24-hour grace period honored for recently rotated keys.
+## Design Patterns
 
-Both filters populate a request-scoped `MerchantContext`, so downstream controllers/services no longer need the merchant ID passed in manually. JPA auditing (`BaseEntity` + `AuditorAwareImpl`) uses this same context to stamp `createdBy`/`updatedBy` with the API key ID (or merchant ID as a fallback).
-
-API key lookups are backed by a **Redis cache** (`ApiKeyCache` / `RedisApiKeyCache`, 5-minute TTL) so the API-key filter doesn't hit Postgres on every request; a cache miss falls back to the DB and repopulates the cache. Each API-key-authenticated request is also checked against a **Redis-backed fixed-window rate limiter** (`RateLimiter` / `FixedWindowRateLimiter`), keyed per API key, with configurable requests-per-minute. Requests over the limit get a `429` with `Retry-After` / `X-RateLimit-*` headers; allowed requests get their remaining quota back in the response headers.
+| Pattern | Where | Purpose |
+|---|---|---|
+| **Strategy** | `payment.processor` (`PaymentProcessor`, `CardPaymentProcessor`, `NetBankingPaymentProcessor`, `UpiPaymentProcessor`) | Per-payment-method processing logic, selected at runtime via `PaymentProcessorRouter` |
+| **Adapter** | `payment.gateway` (`PaymentAdapter`, `CardPaymentAdapter`, `NetBankingAdapter`, `UpiPaymentAdapter`) | Wraps gateway-specific initiate/capture logic behind a common interface, routed via `PaymentGatewayRouter` |
+| **State Machine** | `payment.statemachine` (`PaymentStateMachine`, `PaymentTransitionService`) | Enforces valid payment status transitions via a transition table, with each transition logged to `PaymentTransitionLog` |
+| **Strategy** | `common.ratelimit` (`RateLimiter` interface with `FixedWindowRateLimiter`, `SingleWindowRateLimiter`, `SlidingWindowLuaLimiter`, `TokenBucketRateLimiter`) | Swappable rate-limiting algorithms selected via `app.rate-limit.method` config property |
 
 ## Tech Stack
 
 - **Language:** Java 25
 - **Framework:** Spring Boot 4.1.1, Spring Data JPA, Spring Security
-- **Auth:** JWT (`jjwt`), BCrypt-hashed API keys
 - **Database:** PostgreSQL
-- **Cache / Rate Limiting:** Redis (`spring-boot-starter-data-redis`) — API key cache + fixed-window rate limiter
-- **Object Mapping:** MapStruct
+- **Cache / Rate Limiting / Idempotency:** Redis
+- **Mapping:** MapStruct
+- **Auth:** JWT (jjwt), API key authentication
 - **Build Tool:** Maven
 - **Planned:** Apache Kafka, Docker, Zipkin, Prometheus/Grafana
 
@@ -68,33 +69,41 @@ API key lookups are backed by a **Redis cache** (`ApiKeyCache` / `RedisApiKeyCac
 ```
 src/main/java/com/ankitgupta/razorpay/
 ├── common/
-│   ├── entity/         # Shared value types (Money), BaseEntity (created/updated audit columns)
-│   ├── audit/           # AuditorAwareImpl — resolves current actor for JPA auditing
+│   ├── entity/         # Shared value types (Money, BaseEntity)
 │   ├── enums/          # Shared enums (statuses, actors, events, roles)
-│   ├── exception/      # GlobalExceptionHandler, custom exceptions (incl. RateLimitException), ErrorResponse
-│   ├── ratelimit/       # RateLimiter, FixedWindowRateLimiter, RateLimitResult
-│   ├── config/          # RedisConfig
-│   └── util/           # RandomizerUtil
+│   ├── exception/      # GlobalExceptionHandler, custom exceptions, ErrorResponse
+│   ├── util/           # RandomizerUtil
+│   ├── audit/          # AuditorAwareImpl
+│   ├── ratelimit/       # RateLimiter strategies (fixed, sliding, sliding-lua, token bucket)
+│   └── idempotency/     # IdempotencyFilter, IdempotencyStore, RedisIdempotencyStoreStore
 ├── merchant/
 │   ├── entity/         # Merchant, ApiKey, AppUser, Customer, MerchantWebhookConfig
 │   ├── controller/     # AuthController, ApiKeyController
 │   ├── service/        # AuthService, ApiKeyService (+ impl)
 │   ├── repository/     # MerchantRepository, ApiKeyRepository, AppUserRepository
-│   ├── security/       # WebSecurityConfig, JwtUtil, JwtAuthenticationFilter,
-│   │                    # ApiKeyAuthenticationFilter, MerchantContext
-│   ├── cache/           # ApiKeyCache, ApiKeyCacheEntry, RedisApiKeyCache
+│   ├── mapper/          # MerchantMapper, ApiKeyMapper
+│   ├── security/        # JwtUtil, WebSecurityConfig, MerchantUserDetailsService, MerchantContext, JwtAuthenticationFilter, ApiKeyAuthenticationFilter
 │   └── dto/             # request/response DTOs
 ├── payment/
 │   ├── entity/         # OrderRecord, Payment, Refund, PaymentTransitionLog
 │   ├── controller/     # OrderController, PaymentController
 │   ├── service/        # OrderService, PaymentService (+ impl)
-│   ├── repository/     # OrderRepository, PaymentRepository
+│   ├── repository/     # OrderRepository, PaymentRepository, PaymentTransitionLogRepository
+│   ├── mapper/          # OrderMapper, PaymentMapper
+│   ├── gateway/         # PaymentAdapter + per-method adapters (Card, NetBanking, UPI)
+│   ├── processor/       # PaymentProcessor + per-method strategies (Card, NetBanking, UPI)
+│   ├── statemachine/    # PaymentStateMachine, PaymentTransitionService
+│   ├── simulator/       # BankCallbackSimulator, SimulatorConfig
+│   ├── config/          # PaymentAdapterConfig, PaymentProcessorConfig
 │   └── dto/             # request/response DTOs
 ├── vault/
-│   ├── entity/         # VaultCard, CardToken
-│   ├── controller/     # VaultController
-│   ├── service/        # VaultService
-│   └── dto/             # request/response DTOs
+│   ├── entity/          # VaultCard, CardToken
+│   ├── controller/      # VaultController
+│   ├── service/         # VaultService (+ impl)
+│   ├── repository/      # VaultCardRepository, CardTokenRepository
+│   ├── config/          # VaultEncryptionConfig
+│   ├── validation/      # ExpiryYear custom validator
+│   └── dto/              # request/response DTOs
 └── operations/
     └── entity/         # WebhookEvent, Settlement, SettlementPayment, DlqEvent
 ```
@@ -105,11 +114,12 @@ src/main/java/com/ankitgupta/razorpay/
 
 - Java 25
 - PostgreSQL
+- Redis
 - Maven (or use the included `mvnw` wrapper)
 
 ### Installation
 
-```
+```bash
 git clone <repo-url>
 cd razorpay
 cp src/main/resources/application.yaml.example src/main/resources/application.yaml
@@ -117,78 +127,81 @@ cp src/main/resources/application.yaml.example src/main/resources/application.ya
 
 Set the following environment variables:
 
-| Variable      | Description                                                  |
-| ------------- | -------------------------------------------------------------- |
-| `DB_URL`      | JDBC URL, e.g. `jdbc:postgresql://localhost:5432/razorpayDB` |
-| `DB_USERNAME` | PostgreSQL username                                          |
-| `DB_PASSWORD` | PostgreSQL password                                          |
-| `SECRET_KEY`  | Secret key used to sign/verify JWT access tokens              |
-| `REDIS_HOST`  | Redis host (defaults to `localhost`)                          |
-| `REDIS_PORT`  | Redis port (defaults to `6379`)                               |
-| `REDIS_PASSWORD` | Redis password, if any (defaults to empty)                 |
-
-A local Redis instance is required — e.g. `docker run -p 6379:6379 redis` — for the API key cache and rate limiter to work.
+| Variable | Description |
+|---|---|
+| `DB_URL` | JDBC URL, e.g. `jdbc:postgresql://localhost:5432/razorpayDB` |
+| `DB_USERNAME` | PostgreSQL username |
+| `DB_PASSWORD` | PostgreSQL password |
 
 ### Run
 
-```
+```bash
 ./mvnw spring-boot:run
 ```
 
 ## Development Status
 
 **Completed**
-
 - JPA entity layer modeled across all five domains (Merchant, Payment, Vault, Operations, Common)
-- JPA auditing (`BaseEntity`, `AuditorAwareImpl`) stamping `createdAt`/`updatedAt`/`createdBy`/`updatedBy` on entities
-- Merchant signup flow (`AuthController`, `AuthService`)
-- API key lifecycle: issuance, listing, revocation, rotation with grace period (`ApiKeyController`, `ApiKeyService`)
-- Dual Spring Security filter chains: JWT auth for dashboard/admin routes, API key (Basic-style) auth for API routes (`WebSecurityConfig`, `JwtUtil`, `JwtAuthenticationFilter`, `ApiKeyAuthenticationFilter`)
-- Request-scoped `MerchantContext` propagating the authenticated merchant across controllers/services
+- Merchant signup and login flow (`AuthController`, `AuthService`), password hashing via `BCryptPasswordEncoder`
+- JWT authentication and API key authentication, each with its own Spring Security filter chain
+- API key lifecycle: issuance, listing, revocation, rotation, Redis-backed caching (`ApiKeyController`, `ApiKeyService`)
 - Order creation flow (`OrderController`, `OrderService`)
-- Payment initiation and capture endpoints (`PaymentController`) — see [Known Issues](#known-issues)
-- Card tokenization endpoint (`VaultController`)
-- Repository layer for Merchant, ApiKey, AppUser, Order, Payment
+- Payment initiation and capture flow (`PaymentController`, `PaymentService`)
+- Payment routing via Strategy/Adapter pattern across Card, NetBanking, and UPI methods
+- Payment state machine for status transitions, with transition logging
+- Vault card tokenization with envelope encryption (AES-GCM, DEK/KEK key hierarchy)
+- Bank callback simulator for asynchronous payment status polling
+- Swappable rate limiting (fixed window, sliding window, sliding window via Lua, token bucket via Lua), selected via config
+- Redis-backed idempotency handling for POST/PUT/PATCH requests, scoped per merchant
+- Repository layer for Merchant, ApiKey, AppUser, Order, Payment, PaymentTransitionLog, VaultCard, CardToken
 - Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
-- Request validation via `spring-boot-starter-validation`
-- Redis-backed API key cache (`ApiKeyCache`/`RedisApiKeyCache`) to avoid a DB hit on every API-key-authenticated request
-- Redis-backed fixed-window rate limiter (`RateLimiter`/`FixedWindowRateLimiter`) applied per API key in `ApiKeyAuthenticationFilter`, with `429`/`Retry-After`/`X-RateLimit-*` handling in `GlobalExceptionHandler`
-
-**In progress**
-
-- Payment capture / state-transition logic
-- Refunds
-- Webhook delivery and settlements (Operations domain)
-
-## Known Issues
-
-- **Payments:** the payment initiate/capture flow (`PaymentController` → `PaymentService`) has a known issue currently being debugged — treat this endpoint as unstable until it's fixed and this note is removed.
-
-This project is being built step by step, domain by domain, rather than end-to-end — expect other rough edges outside of what's listed above as work progresses.
+- Request validation via `spring-boot-starter-validation`, including a custom `@ExpiryYear` validator
+- Entity auditing (`BaseEntity` with `createdAt`/`updatedAt`, `@EnableJpaAuditing`, `AuditorAwareImpl`)
+- MapStruct mappers for Merchant, ApiKey, Order, Payment DTO conversion
 
 ## Development Log
 
 ### 2026-09-05
-
-- Added Redis integration (`RedisConfig`, `StringRedisTemplate` bean)
-- Added `ApiKeyCache` interface with a `RedisApiKeyCache` implementation (5-minute TTL) — `ApiKeyAuthenticationFilter` now checks the cache before hitting `ApiKeyRepository`, and repopulates the cache on a miss
-- Added Redis-backed fixed-window rate limiting: `RateLimiter` interface, `FixedWindowRateLimiter` implementation, `RateLimitResult`, keyed per API key and applied inside `ApiKeyAuthenticationFilter`
-- Added `RateLimitException` and a corresponding handler in `GlobalExceptionHandler` returning `429` with `Retry-After` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` headers
-- `ApiKeyServiceImpl` now evicts the Redis cache entry on key revoke and rotate, so stale keys/secrets stop working immediately instead of waiting out the TTL
-- Added `spring-boot-starter-data-redis` dependency and Redis connection settings (`REDIS_HOST`/`REDIS_PORT`/`REDIS_PASSWORD`) to `application.yaml.example`
+- Added idempotency handling: `IdempotencyFilter`, `IdempotencyStore` interface, `RedisIdempotencyStoreStore`, `IdempotencyConflictException`
+- Added three additional rate limiting strategies: `SingleWindowRateLimiter` (sliding window), `SlidingWindowLuaLimiter` (atomic, Lua-based), `TokenBucketRateLimiter` (atomic, Lua-based)
+- Wired `ApiKeyAuthenticationFilter` into a dedicated `apiKeyChain` Spring Security filter chain, scoped to `API_KEY_ROUTES`
+- Ordered `IdempotencyFilter` to run after authentication in both the JWT and API key filter chains
 
 ### 2026-09-04
+- Added Redis-backed API key caching and rate limiting
 
-- Added Spring Security: `WebSecurityConfig` with two filter chains — JWT for dashboard/admin routes, API key (Basic-style, BCrypt-verified) for API routes
-- Added `JwtUtil` (access token generation/verification) and `JwtAuthenticationFilter`
-- Added `ApiKeyAuthenticationFilter`, including grace-period support for rotated keys
-- Added request-scoped `MerchantContext` and wired it through `OrderController`, `PaymentController`, `VaultController`, and `ApiKeyController` in place of manually passed merchant IDs
-- Added JPA auditing support: `BaseEntity` (`createdAt`/`updatedAt`/`createdBy`/`updatedBy`) and `AuditorAwareImpl`, enabled via `@EnableJpaAuditing` in `RazorpayApplication`
-- Added `PaymentController` with payment initiation and capture endpoints (known issue — see [Known Issues](#known-issues))
-- Added `VaultController` with a card tokenization endpoint
+### 2026-09-03
+- Added merchant login flow: `AuthController` login endpoint, `LoginRequest`/`LoginResponse` DTOs
+- Added JWT support: `JwtUtil` for token generation/verification (jjwt)
+- Added Spring Security scaffold: `WebSecurityConfig`, `MerchantUserDetailsService`, `AppUser` implementing `UserDetails`
+- Added `spring-boot-starter-security` and `jjwt` dependencies
+- Fixed `PaymentTransitionService.apply()` `fromStatus` ordering bug
+- Fixed `PaymentProcessorConfig` to use constructor-injected Spring beans instead of manual instantiation
+- Fixed `SimulatorConfig` missing `@Getter`/`@Setter` for configuration property binding
+
+### 2026-09-02
+- Implemented payment initiation and capture flow: `PaymentController`, `PaymentService`/`PaymentServiceImpl`
+- Added Strategy pattern for payment processing: `PaymentProcessor` interface with `CardPaymentProcessor`, `NetBankingPaymentProcessor`, `UpiPaymentProcessor`, routed via `PaymentProcessorRouter`
+- Added Adapter pattern for gateway integration: `PaymentAdapter` interface with `CardPaymentAdapter`, `NetBankingAdapter`, `UpiPaymentAdapter`, routed via `PaymentGatewayRouter`
+- Added payment state machine: `PaymentStateMachine`, `PaymentTransitionService`, `InvalidStateTransitionException`
+- Added vault card tokenization: `VaultController`, `VaultService`/`VaultServiceImpl`, envelope encryption via `VaultEncryptionConfig`
+- Added bank callback simulator: `BankCallbackSimulator`, `SimulatorConfig`
+- Added `PaymentTransitionLogRepository`, `VaultCardRepository`, `CardTokenRepository`
+- Added `PaymentAdapterConfig`, `PaymentProcessorConfig` for bean wiring
+
+### 2026-09-01
+- Added JPA auditing: `BaseEntity` with `@CreatedDate`/`@LastModifiedDate`, wired into entities via `@EnableJpaAuditing`
+- Added MapStruct dependency and mappers: `MerchantMapper`, `ApiKeyMapper`, `OrderMapper`, `PaymentMapper`
+- Added `BusinessRuleViolationException` for business-rule-level errors
+- Added `PaymentResponse` DTO
+- Refactored service layer to use mappers instead of manual DTO construction
+- Fixed MapStruct core/processor version mismatch in `pom.xml`
+- Fixed `SettlementPaymentId`/`SettlementPayment` auditing placement (moved `BaseEntity` inheritance to the entity, off the embedded ID)
+- Fixed `MerchantMapper` field mapping for `status` → `merchantStatus`
+- Added database indexes across entities: `ApiKey`, `Merchant`, `AppUser`, `Customer`, `MerchantWebhookConfig`, `Payment`, `OrderRecord`, `PaymentTransitionLog`
 
 ### 2026-08-31
-
 - Added API key management: list keys by merchant, revoke key, rotate key (with grace period on the previous secret)
 - Implemented order creation flow: `OrderController`, `OrderService`/`OrderServiceImpl`, duplicate-receipt detection, configurable order expiry
 - Added `RandomizerUtil` for key/secret generation
@@ -196,7 +209,6 @@ This project is being built step by step, domain by domain, rather than end-to-e
 - Refactored `Money` to use Lombok annotations instead of manual boilerplate
 
 ### 2026-08-30
-
 - Implemented merchant signup flow: `AuthController`, `AuthService`/`AuthServiceImpl`, `MerchantSignupRequest`/`MerchantResponse` DTOs
 - Implemented API key issuance flow: `ApiKeyController`, `ApiKeyService`/`ApiKeyServiceImpl`, `CreateApiKeyRequest`/`ApiKeyCreateResponse` DTOs
 - Added repository layer: `MerchantRepository`, `ApiKeyRepository`, `AppUserRepository`
@@ -204,6 +216,5 @@ This project is being built step by step, domain by domain, rather than end-to-e
 - Added `spring-boot-starter-validation` dependency for request validation
 
 ### 2026-08-27
-
 - Modeled full entity relationship schema and JPA entities across merchant, payment, vault, and operations domains
 - Initialized project with Spring Boot 4.1.1, Java 25, Spring Data JPA, PostgreSQL, Lombok
