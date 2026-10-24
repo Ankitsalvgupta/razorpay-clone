@@ -11,7 +11,7 @@ import java.util.UUID;
 @Component
 @RequiredArgsConstructor
 @ConditionalOnProperty(name = "app.rate-limit.method", havingValue = "sliding")
-public class SingleWindowRateLimiter implements RateLimiter{
+public class SlidingWindowRateLimiter implements RateLimiter{
 
     private final StringRedisTemplate redis;
 
