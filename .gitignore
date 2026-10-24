@@ -41,4 +41,4 @@ build/
 # ===========================
 .env
 application.yaml
-application.properties
+application.properties.env

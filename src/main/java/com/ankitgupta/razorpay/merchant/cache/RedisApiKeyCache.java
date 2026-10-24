@@ -14,8 +14,8 @@ import java.util.Optional;
 @RequiredArgsConstructor
 public class RedisApiKeyCache implements ApiKeyCache{
 
-    private static final String PREFIX = "apikey";
-    private static final Duration ITL = Duration.ofMinutes(5);
+    private static final String PREFIX = "apikey:";
+    private static final Duration TTL = Duration.ofMinutes(5);
 
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
@@ -29,7 +29,7 @@ public class RedisApiKeyCache implements ApiKeyCache{
             }
             return Optional.of(objectMapper.readValue(json, ApiKeyCacheEntry.class));
         } catch (Exception e) {
-            log.warn("ApiKey cache read filed, keyId: {}", keyId);
+            log.warn("ApiKey cache read failed, keyId: {}", keyId);
             return Optional.empty();
         }
     }
@@ -39,9 +39,9 @@ public class RedisApiKeyCache implements ApiKeyCache{
         try {
             stringRedisTemplate.opsForValue().set(PREFIX+keyId,
                     objectMapper.writeValueAsString(entry),
-                    ITL);
+                    TTL);
         } catch (Exception e) {
-            log.warn("ApiKey cache put filed, keyId: {}", keyId);
+            log.warn("ApiKey cache put failed, keyId: {}", keyId);
         }
     }
 
