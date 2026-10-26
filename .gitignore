@@ -36,9 +36,25 @@ build/
 # ===========================
 # CREDENTIALS & SECRETS
 # ===========================
-# ===========================
-# CREDENTIALS & SECRETS
-# ===========================
+# Environment files (keep the *.example templates tracked)
 .env
+.env.*
+!.env.example
+
+# Spring config with real values (application.yaml.example stays tracked)
 application.yaml
-application.properties.env
+application.yml
+application-*.yaml
+application-*.yml
+application.properties
+application-*.properties
+!**/application*.example
+
+# Keys, certificates, keystores
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets/
