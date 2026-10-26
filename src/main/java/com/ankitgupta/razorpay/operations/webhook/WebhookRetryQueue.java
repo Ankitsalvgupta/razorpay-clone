@@ -1,6 +1,7 @@
 package com.ankitgupta.razorpay.operations.webhook;
 
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
@@ -14,6 +15,7 @@ import java.util.stream.Collectors;
 
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class WebhookRetryQueue {
 
     private final StringRedisTemplate redisTemplate;
@@ -24,6 +26,7 @@ public class WebhookRetryQueue {
     public void enqueue(UUID webhookEventId, LocalDateTime retryAt) {
         long time = getTime(retryAt);
         redisTemplate.opsForZSet().add(key, webhookEventId.toString(), time);
+        log.info("Enqueued a webhook event with id: {}", webhookEventId);
     }
 
     public Set<UUID> pollDue(int limit) {

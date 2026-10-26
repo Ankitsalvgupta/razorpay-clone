@@ -21,7 +21,7 @@ A payment gateway backend modeled on Razorpay's core flows — merchant onboardi
 - **Payment lifecycle engine** — Strategy/Adapter routing per payment method and a transition-table state machine with a full audit log of every status change
 - **PCI-conscious vault** — card numbers encrypted with envelope encryption (AES-GCM, per-card data key wrapped by a master key); CVV is validated but never stored
 - **Transactional outbox + Kafka** — order and payment events are written in the same database transaction as the state change, then published to Kafka by a poller
-- **Merchant webhooks** — per-merchant endpoints with event-type subscriptions, HMAC-SHA256 signed payloads, and a Redis-backed retry queue
+- **Merchant webhooks** — per-merchant endpoints with event-type subscriptions, HMAC-SHA256 signed payloads, delivery over HTTP with exponential backoff, and a dead-letter store for events that exhaust their retries
 - **Production-style safeguards** — idempotency keys, swappable Redis rate limiters, pessimistic row locking on concurrent payment operations
 
 ## Overview
@@ -33,7 +33,7 @@ The system is designed around five domains:
 | **Merchant** | Merchant accounts, KYC, API key issuance, dashboard users, customers, webhook configuration |
 | **Payment** | Orders, payments, refunds, payment state transitions, outbox events |
 | **Vault** | PCI-scoped card storage and tokenization, isolated from the rest of the system |
-| **Operations** | Webhook event processing and delivery scheduling, settlements, dead-letter/event replay |
+| **Operations** | Webhook event processing, delivery and retry scheduling, dead-letter storage, settlements |
 | **Common** | Shared value types, enums, encryption, rate limiting, and idempotency infrastructure |
 
 Cross-domain references (e.g. an order's `merchantId`/`customerId`, a card token's `merchant`/`customer`) are stored as plain UUIDs rather than JPA relationships, and cross-domain calls go through interfaces (e.g. `MerchantWebhookApi`), in anticipation of the microservices split where these domains will live in separate services with separate databases.
@@ -68,11 +68,32 @@ flowchart LR
     E -->|resolve active targets| F["MerchantWebhookApi"]
     E -->|HMAC-SHA256 sign + persist| G[("webhook_event")]
     E -->|enqueue| H[("Redis retry queue")]
-    H --> I["WebhookDeliveryScheduler"]
+    E -.->|unprocessable record| K[("dlq_event")]
+    H -->|poll every 1s| I["WebhookDeliveryScheduler"]
     G -.->|reconcile every 10s| H
+    I -->|virtual thread per delivery| J["WebhookDeliverExecutor"]
+    J -->|POST + signature header| M["Merchant endpoint"]
+    J -->|failure: schedule retry| H
+    J -.->|attempts exhausted| K
 ```
 
 Published event types: `ORDER_CREATED`, `ORDER_CANCELLED`, `PAYMENT_CREATED`, `PAYMENT_STATUS_CHANGED`. Each outbox event is retried up to three times before being marked `FAILED`.
+
+### Webhook delivery
+
+Each Kafka event is turned into one `WebhookEvent` per matching merchant endpoint, signed with that endpoint's secret, and delivered by `WebhookDeliverExecutor`.
+
+| Aspect | Behavior |
+|---|---|
+| Request | `POST` to the merchant's target URL with JSON body `{"event": ..., "payload": ...}` and the HMAC-SHA256 signature in the `X-Razorpay-Signature` header (configurable through `webhook.delivery.signature-header`) |
+| Timeouts | 3 seconds to connect, 5 seconds to read |
+| Success | Any `2xx` response marks the event `DELIVERED` |
+| Retry schedule | After failed attempts 1 to 6: 1 minute, 5 minutes, 30 minutes, 2 hours, 8 hours, 24 hours |
+| Exhaustion | After 7 failed attempts the event is marked `DEAD` and a `dlq_event` row is written in a separate transaction |
+| Concurrency | Due deliveries are polled from Redis every second and run on virtual threads |
+| Recovery | Every 10 seconds, pending events missing from Redis are re-enqueued from the database |
+
+The Kafka consumer acknowledges records manually. If the database is unavailable, the record is not acknowledged and Kafka redelivers it. If a record cannot be processed because of a logic error, it is stored in `dlq_event` and acknowledged so it does not block the partition.
 
 **Redis** is used for API key caching, rate limiting, idempotency key storage, and the webhook retry queue. Observability is provided through **Zipkin** (distributed tracing) and **Prometheus/Grafana** (metrics).
 
@@ -85,6 +106,7 @@ Published event types: `ORDER_CREATED`, `ORDER_CANCELLED`, `PAYMENT_CREATED`, `P
 | **State Machine** | `payment.statemachine` (`PaymentStateMachine`, `PaymentTransitionService`) | Enforces valid payment status transitions via a transition table, with each transition logged to `PaymentTransitionLog` |
 | **Strategy** | `common.ratelimit` (`RateLimiter` with `FixedWindowRateLimiter`, `SlidingWindowRateLimiter`, `SlidingWindowLuaLimiter`, `TokenBucketRateLimiter`) | Swappable rate-limiting algorithms selected via the `app.rate-limit.method` property |
 | **Transactional Outbox** | `payment.outbox` (`OutboxEventPublisher`, `OutboxPoller`, `OutboxResultHandler`) | Atomically couples a state change with its event, then publishes to Kafka with retry accounting |
+| **Dead Letter Queue** | `operations.webhook` (`WebhookDlqRecorder`, `DlqEvent`) | Preserves events that cannot be delivered or consumed, with the final error and original payload, for inspection and replay |
 | **Ports and Adapters** | `merchant.api.MerchantWebhookApi` | Lets the operations domain read webhook targets without depending on merchant internals |
 
 ## Tech Stack
@@ -115,6 +137,7 @@ Published event types: `ORDER_CREATED`, `ORDER_CANCELLED`, `PAYMENT_CREATED`, `P
 | `POST` | `/v1/payments` | API key | Initiate a payment against an order |
 | `POST` | `/v1/payments/{paymentId}/capture` | API key | Capture an authorized payment |
 | `POST` | `/v1/vault/tokenize` | API key | Tokenize a card |
+| `POST` | `/webhook/success` | Public | Sample merchant webhook receiver that returns `204`, for exercising delivery locally |
 
 API key requests use HTTP Basic authentication with the key ID as username and the key secret as password. Write requests (`POST`, `PUT`, `PATCH`) accept an `X-Idempotency-Key` header; a repeated key replays the original response.
 
@@ -165,8 +188,10 @@ src/main/java/com/ankitgupta/razorpay/
 │   └── dto/            # request/response DTOs
 └── operations/
     ├── entity/         # WebhookEvent, Settlement, SettlementPayment, DlqEvent
-    ├── repository/     # WebhookEventRepository
-    └── webhook/        # WebhookKafkaConsumer, WebhookRetryQueue, WebhookDeliveryScheduler
+    ├── controller/     # DummyMerchantWebhookController (sample receiver)
+    ├── config/         # WebhookClientConfig (RestClient with timeouts)
+    ├── repository/     # WebhookEventRepository, DlqEventRepository
+    └── webhook/        # WebhookKafkaConsumer, WebhookRetryQueue, WebhookDeliveryScheduler, WebhookDeliverExecutor, WebhookDlqRecorder
 ```
 
 ## Getting Started
@@ -201,12 +226,12 @@ Set the following environment variables:
 |---|---|
 | `DB_URL` | JDBC URL, e.g. `jdbc:postgresql://localhost:5432/razorpay-db` |
 | `DB_USERNAME` | PostgreSQL username |
-| `DB_PASSWORD` | PostgreSQL password |
+| `DB_PASSWORD` | PostgreSQL password; also read by Docker Compose from a `.env` file next to `services.docker-compose.yaml` |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | Redis connection (defaults: `localhost`, `6379`, empty) |
 | `MASTER_KEY` | Base64-encoded 32-byte AES-256 master key; generate with `openssl rand -base64 32` |
 | `SECRET_KEY` | HMAC secret used to sign JWTs (at least 32 characters) |
 
-Kafka topic names are configured under `app.kafka.topics`, and the active rate limiter under `app.rate-limit.method` (`fixed`, `sliding`, `sliding-lua`, or `bucket`).
+Kafka topic names are configured under `app.kafka.topics`, and the active rate limiter under `app.rate-limit.method` (`fixed`, `sliding`, `sliding-lua`, or `bucket`). Webhook delivery can be tuned with `app.webhook.delivery.poll-batch-size`, `app.webhook.delivery.redis-key`, and `webhook.delivery.signature-header`.
 
 ### Run
 
@@ -234,6 +259,8 @@ Kafka topic names are configured under `app.kafka.topics`, and the active rate l
 - Transactional outbox with Kafka publishing for order and payment events, including retry accounting
 - Merchant webhook configuration (CRUD, event-type subscriptions, signing secrets encrypted at rest)
 - Webhook event pipeline: Kafka consumption, per-merchant target resolution, HMAC-SHA256 signing, persisted `WebhookEvent`, and a Redis-backed retry queue with database reconciliation
+- HTTP webhook delivery with signed requests, timeouts, exponential backoff, and per-attempt tracking on `WebhookEvent`
+- Dead-letter storage (`DlqEvent`) for webhooks that exhaust their retries and for Kafka records that cannot be processed
 - Docker Compose setup for local PostgreSQL, Redis, and Kafka
 - Repository layer for Merchant, ApiKey, AppUser, Customer, WebhookConfig, Order, Payment, PaymentTransitionLog, OutboxEvent, WebhookEvent, VaultCard, CardToken
 - Global exception handling (`GlobalExceptionHandler`, custom exceptions, error response format)
@@ -242,6 +269,16 @@ Kafka topic names are configured under `app.kafka.topics`, and the active rate l
 - MapStruct mappers for Merchant, ApiKey, WebhookConfig, Order, Payment DTO conversion
 
 ## Development Log
+
+### 2026-10-26
+- Added webhook delivery: `WebhookDeliverExecutor` posts signed events to merchant endpoints and records status code, response body, and attempt count on `WebhookEvent`
+- Added exponential backoff retries (1 minute to 24 hours) with a seven-attempt limit, driven by the Redis retry queue and dispatched on virtual threads from `WebhookDeliveryScheduler`
+- Added dead-letter handling: `DlqEvent`, `DlqEventRepository`, and `WebhookDlqRecorder` store exhausted deliveries and unprocessable Kafka records
+- Switched `WebhookKafkaConsumer` to manual acknowledgment: database outages trigger redelivery, logic errors are dead-lettered
+- Added `WebhookClientConfig` with 3-second connect and 5-second read timeouts for outbound webhook calls
+- Added `DummyMerchantWebhookController` (`POST /webhook/success`) as a local receiver, and opened `/webhook/**` in the security configuration
+- Webhook secret decryption now Base64-decodes the stored ciphertext before decrypting
+- Moved Lombok builder and accessor annotations onto `DlqEvent` and defaulted `WebhookEvent.attempts` to zero
 
 ### 2026-10-24
 - Added the transactional outbox: `OutboxEvent` entity, `OutboxEventPublisher`, `OutboxPoller` (publishes to Kafka keyed by merchant ID), `OutboxResultHandler` (marks events `FAILED` after three attempts), `OutboxEventRepository`, `OutboxStatus`, `EventAggregateType`
