@@ -22,6 +22,7 @@ A payment gateway backend modeled on Razorpay's core flows — merchant onboardi
 - **PCI-conscious vault** — card numbers encrypted with envelope encryption (AES-GCM, per-card data key wrapped by a master key); CVV is validated but never stored
 - **Transactional outbox + Kafka** — order and payment events are written in the same database transaction as the state change, then published to Kafka by a poller
 - **Merchant webhooks** — per-merchant endpoints with event-type subscriptions, HMAC-SHA256 signed payloads, delivery over HTTP with exponential backoff, and a dead-letter store for events that exhaust their retries
+- **Nightly settlements** — captured payments are grouped per merchant, charged a platform fee plus GST, and transferred to the merchant's bank account, with status tracking and settlement events
 - **Production-style safeguards** — idempotency keys, swappable Redis rate limiters, pessimistic row locking on concurrent payment operations
 
 ## Overview
@@ -77,7 +78,7 @@ flowchart LR
     J -.->|attempts exhausted| K
 ```
 
-Published event types: `ORDER_CREATED`, `ORDER_CANCELLED`, `PAYMENT_CREATED`, `PAYMENT_STATUS_CHANGED`. Each outbox event is retried up to three times before being marked `FAILED`.
+Published event types: `ORDER_CREATED`, `ORDER_CANCELLED`, `PAYMENT_CREATED`, `PAYMENT_STATUS_CHANGED`, `SETTLEMENT_PROCESSED`, `SETTLEMENT_FAILED`. Each outbox event is retried up to three times before being marked `FAILED`.
 
 ### Webhook delivery
 
@@ -97,6 +98,20 @@ The Kafka consumer acknowledges records manually. If the database is unavailable
 
 **Redis** is used for API key caching, rate limiting, idempotency key storage, and the webhook retry queue. Observability is provided through **Zipkin** (distributed tracing) and **Prometheus/Grafana** (metrics).
 
+### Settlement
+
+`SettlementEngine` runs every night at 23:00 and settles each active merchant in parallel on virtual threads. For one merchant, `SettlementTransactionExecutor` works in a single transaction:
+
+| Step | Behavior |
+|---|---|
+| Select | Loads the merchant's captured, unsettled payments under a pessimistic write lock |
+| Calculate | Gross is the sum of payment amounts; fee is 2% of gross; GST is 18% of the fee; net is gross minus fee minus GST |
+| Record | Saves a `Settlement` (`INITIATED`) and links each payment through `SettlementPayment` |
+| Transfer | Reads the merchant's bank details, calls `BankTransferProcessor`, and moves the settlement to `TRANSFER_PENDING` with the bank reference |
+| Resolve | The bank callback moves it to `PROCESSED`, or `FAILED` with a failure reason, and publishes `SETTLEMENT_PROCESSED` or `SETTLEMENT_FAILED` through the outbox |
+
+Status flow: `INITIATED` → `TRANSFER_PENDING` → `PROCESSED` or `FAILED`. A scheduled `BankSettlementCallbackSimulator` resolves pending transfers every five seconds, standing in for the bank. The operations domain reaches payment and merchant data through `PaymentLookupService` and `MerchantLookupService`, never through their repositories.
+
 ## Design Patterns
 
 | Pattern | Where | Purpose |
@@ -107,7 +122,8 @@ The Kafka consumer acknowledges records manually. If the database is unavailable
 | **Strategy** | `common.ratelimit` (`RateLimiter` with `FixedWindowRateLimiter`, `SlidingWindowRateLimiter`, `SlidingWindowLuaLimiter`, `TokenBucketRateLimiter`) | Swappable rate-limiting algorithms selected via the `app.rate-limit.method` property |
 | **Transactional Outbox** | `payment.outbox` (`OutboxEventPublisher`, `OutboxPoller`, `OutboxResultHandler`) | Atomically couples a state change with its event, then publishes to Kafka with retry accounting |
 | **Dead Letter Queue** | `operations.webhook` (`WebhookDlqRecorder`, `DlqEvent`) | Preserves events that cannot be delivered or consumed, with the final error and original payload, for inspection and replay |
-| **Ports and Adapters** | `merchant.api.MerchantWebhookApi` | Lets the operations domain read webhook targets without depending on merchant internals |
+| **Ports and Adapters** | `merchant.api` (`MerchantWebhookApi`, `MerchantLookupService`), `payment.api` (`PaymentLookupService`) | Lets the operations domain read webhook targets, active merchants, bank details, and unsettled payments without depending on merchant or payment internals |
+| **Strategy** | `operations.settlement` (`BankTransferProcessor`) | Abstracts the bank transfer call so a real bank integration can replace the current implementation |
 
 ## Tech Stack
 
@@ -190,7 +206,8 @@ src/main/java/com/ankitgupta/razorpay/
     ├── entity/         # WebhookEvent, Settlement, SettlementPayment, DlqEvent
     ├── controller/     # DummyMerchantWebhookController (sample receiver)
     ├── config/         # WebhookClientConfig (RestClient with timeouts)
-    ├── repository/     # WebhookEventRepository, DlqEventRepository
+    ├── repository/     # WebhookEventRepository, DlqEventRepository, SettlementRepository, SettlementPaymentRepository
+    ├── settlement/     # SettlementEngine, SettlementTransactionExecutor, BankTransferProcessor (+ impl), BankSettlementCallbackSimulator, dto/BankTransferResult
     └── webhook/        # WebhookKafkaConsumer, WebhookRetryQueue, WebhookDeliveryScheduler, WebhookDeliverExecutor, WebhookDlqRecorder
 ```
 
@@ -260,6 +277,7 @@ Kafka topic names are configured under `app.kafka.topics`, and the active rate l
 - Merchant webhook configuration (CRUD, event-type subscriptions, signing secrets encrypted at rest)
 - Webhook event pipeline: Kafka consumption, per-merchant target resolution, HMAC-SHA256 signing, persisted `WebhookEvent`, and a Redis-backed retry queue with database reconciliation
 - HTTP webhook delivery with signed requests, timeouts, exponential backoff, and per-attempt tracking on `WebhookEvent`
+- Nightly settlement engine with fee and GST calculation, bank transfer initiation, simulated bank callbacks, and `SETTLEMENT_PROCESSED` / `SETTLEMENT_FAILED` events
 - Dead-letter storage (`DlqEvent`) for webhooks that exhaust their retries and for Kafka records that cannot be processed
 - Docker Compose setup for local PostgreSQL, Redis, and Kafka
 - Repository layer for Merchant, ApiKey, AppUser, Customer, WebhookConfig, Order, Payment, PaymentTransitionLog, OutboxEvent, WebhookEvent, VaultCard, CardToken
@@ -269,6 +287,15 @@ Kafka topic names are configured under `app.kafka.topics`, and the active rate l
 - MapStruct mappers for Merchant, ApiKey, WebhookConfig, Order, Payment DTO conversion
 
 ## Development Log
+
+### 2026-11-12
+- Added the settlement engine: `SettlementEngine` runs nightly at 23:00 and settles every active merchant in parallel on virtual threads
+- Added `SettlementTransactionExecutor`: groups captured payments per merchant, computes fee (2%), GST (18% of fee) and net amount, records the `Settlement` and its `SettlementPayment` links, and initiates the bank transfer
+- Added `BankTransferProcessor` and its implementation, `BankTransferResult`, and `BankSettlementCallbackSimulator`, which resolves pending transfers every five seconds
+- Added the `TRANSFER_PENDING` status and `failureReason` on `Settlement`; added `SettlementRepository` and `SettlementPaymentRepository`
+- Settlement outcomes publish `SETTLEMENT_PROCESSED` and `SETTLEMENT_FAILED` through the transactional outbox
+- Added `PaymentLookupService` with a pessimistic-lock query for unsettled captured payments, and `MerchantLookupService` for active merchants, bank details, and webhook targets
+- Added Lombok builder and accessor annotations to `Settlement`, `SettlementPayment`, and `SettlementPaymentId`
 
 ### 2026-10-26
 - Added webhook delivery: `WebhookDeliverExecutor` posts signed events to merchant endpoints and records status code, response body, and attempt count on `WebhookEvent`

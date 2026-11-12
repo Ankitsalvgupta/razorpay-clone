@@ -3,7 +3,7 @@ package com.ankitgupta.razorpay.operations.webhook;
 import com.ankitgupta.razorpay.common.dto.WebhookTarget;
 import com.ankitgupta.razorpay.common.enums.WebhookEventStatus;
 import com.ankitgupta.razorpay.common.util.SignerUtil;
-import com.ankitgupta.razorpay.merchant.api.MerchantWebhookApi;
+import com.ankitgupta.razorpay.merchant.api.MerchantLookupService;
 import com.ankitgupta.razorpay.operations.entity.WebhookEvent;
 import com.ankitgupta.razorpay.operations.repository.WebhookEventRepository;
 import lombok.RequiredArgsConstructor;
@@ -26,7 +26,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class WebhookKafkaConsumer {
 
-    private final MerchantWebhookApi merchantWebhookApi;
+    private final MerchantLookupService merchantWebhookApi;
     private final ObjectMapper objectMapper;
     private final SignerUtil signerUtil;
     private final WebhookEventRepository webhookEventRepository;
